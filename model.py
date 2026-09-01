@@ -222,7 +222,7 @@ class LowFreqBranch(nn.Module):
         return x + res
 
 class ResidualGroup(nn.Module):
-    """高低频分治残差组"""
+    """高低频分治残差组（退化自适应 FiLM + 空间自适应门控融合）"""
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=2., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm):
@@ -234,22 +234,23 @@ class ResidualGroup(nn.Module):
             drop=drop, attn_drop=attn_drop, drop_path=drop_path, norm_layer=norm_layer
         )
         self.low_freq_branch = LowFreqBranch(dim=dim)
-        self.fusion_conv = nn.Conv2d(dim * 2, dim, kernel_size=1)
-        self.norm = norm_layer(dim)
-        self.low_freq_weight = nn.Parameter(torch.tensor(0.7))
-        self.high_freq_weight = nn.Parameter(torch.tensor(0.3))
-    def forward(self, x, x_size):
+        # 空间自适应门控：由高低频特征逐位置生成融合权重 gate∈[0,1]
+        self.fusion_gate = nn.Conv2d(dim * 2, 1, kernel_size=1)
+        self.fusion_conv = nn.Conv2d(dim, dim, kernel_size=1)
+    def forward(self, x, x_size, deg_scale=None, deg_shift=None):
         H, W = x_size
         res = x
+        if deg_scale is not None:
+            # 退化条件 FiLM：逐通道调制（deg_scale/shift 形状 (B,1,C)）
+            x = x * (1 + deg_scale) + deg_shift
         high_feat = self.high_freq_branch(x, x_size)
         low_feat = self.low_freq_branch(x, x_size)
-        weighted_high = self.high_freq_weight * high_feat
-        weighted_low = self.low_freq_weight * low_feat
-        high_feat_2d = tokens_to_image(weighted_high, H, W)
-        low_feat_2d = tokens_to_image(weighted_low, H, W)
-        fused_feat = self.fusion_conv(torch.cat([high_feat_2d, low_feat_2d], dim=1))
+        high_2d = tokens_to_image(high_feat, H, W)
+        low_2d = tokens_to_image(low_feat, H, W)
+        gate = torch.sigmoid(self.fusion_gate(torch.cat([high_2d, low_2d], dim=1)))  # (B,1,H,W)
+        fused_feat = gate * high_2d + (1 - gate) * low_2d
+        fused_feat = self.fusion_conv(fused_feat)
         fused_feat = fused_feat.flatten(2).transpose(1, 2)
-        fused_feat = self.norm(fused_feat)
         return fused_feat + res
 
 class DegradationAwareModule(nn.Module):
@@ -329,24 +330,13 @@ class SwinIRMed(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1)
         if upscale == 4:
+            # 两级 PixelShuffle 上采样：128 -> 256 -> 512，参数更少、更稳
             self.upsample = nn.Sequential(
-                nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1),
-                nn.InstanceNorm2d(embed_dim),
-                nn.GELU(),
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=5, padding=2),
-                nn.GELU(),
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=1),
                 nn.Conv2d(embed_dim, embed_dim * 4, kernel_size=3, padding=1),
                 nn.PixelShuffle(2),
-                nn.InstanceNorm2d(embed_dim),
                 nn.GELU(),
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
+                nn.Conv2d(embed_dim, embed_dim * 4, kernel_size=3, padding=1),
+                nn.PixelShuffle(2),
                 nn.GELU()
             )
         elif upscale == 2:
@@ -371,12 +361,12 @@ class SwinIRMed(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-    def forward_features(self, x):
+    def forward_features(self, x, deg_scale=None, deg_shift=None):
         x_size = (x.shape[2], x.shape[3])
         x = self.patch_embed(x)
         x = self.pos_drop(x)
         for layer in self.layers:
-            x = layer(x, x_size)
+            x = layer(x, x_size, deg_scale, deg_shift)
         x = self.norm(x)
         x = tokens_to_image(x, x_size[0], x_size[1])
         return x
@@ -384,9 +374,12 @@ class SwinIRMed(nn.Module):
         global_residual = F.interpolate(x, scale_factor=self.upscale, mode='bicubic', align_corners=False)
         x_first = self.conv_first(x)
         skip_feat = x_first
-        deg_scale, deg_shift = self.degradation_module(x)
-        x_first = x_first * (1 + deg_scale) + deg_shift
-        x_body = self.forward_features(x_first)
+        # 退化编码：注入到每个残差组（token 空间形状 (B,1,C)）
+        deg_scale, deg_shift = self.degradation_module(x)          # (B, C, 1, 1)
+        B, C = deg_scale.shape[0], deg_scale.shape[1]
+        deg_scale_t = deg_scale.view(B, 1, C)
+        deg_shift_t = deg_shift.view(B, 1, C)
+        x_body = self.forward_features(x_first, deg_scale_t, deg_shift_t)
         x_body = self.conv_after_body(x_body)
         x = x_first + x_body
         x_upscale = self.upsample(x)
@@ -410,14 +403,19 @@ class SwinIRMedLoss(nn.Module):
         self.tv_weight = tv_weight
         self.use_smooth_loss = use_smooth_loss
         self.smooth_weight = smooth_weight
+        # Sobel 核注册为 buffer，避免每次前向重建
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                               dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                               dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
     def gradient_loss(self, pred, gt):
         def sobel(x):
-            sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                                    dtype=torch.float32, device=x.device).view(1, 1, 3, 3)
-            sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-                                    dtype=torch.float32, device=x.device).view(1, 1, 3, 3)
-            edge_x = F.conv2d(x, sobel_x, padding=1)
-            edge_y = F.conv2d(x, sobel_y, padding=1)
+            kx = self.sobel_x.to(device=x.device, dtype=x.dtype)
+            ky = self.sobel_y.to(device=x.device, dtype=x.dtype)
+            edge_x = F.conv2d(x, kx, padding=1)
+            edge_y = F.conv2d(x, ky, padding=1)
             return torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
         pred_edge = sobel(pred)
         gt_edge = sobel(gt)

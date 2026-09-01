@@ -46,12 +46,18 @@ def build_swinir_med(upscale_factor=4, device=None):
     return model
 
 # ===================== DICOM工具函数 =====================
-def read_ima_image(path):
+def read_ima_image(path, return_hu=False):
+    """读取 CT 切片。
+    return_hu=False（默认）：返回按固定窗宽窗位(-1000~400)归一化到[0,255]的 uint8 图，供推理/可视化；
+    return_hu=True：返回 HU（float32，已做 Rescale）原始数组，供训练时的随机窗宽窗位增强使用。
+    """
     ds = pydicom.dcmread(path)
-    img = ds.pixel_array.astype(np.float32)
+    hu = ds.pixel_array.astype(np.float32)
     if hasattr(ds, 'RescaleSlope') and hasattr(ds, 'RescaleIntercept'):
-        img = img * ds.RescaleSlope + ds.RescaleIntercept
-    img = np.clip(img, -1000, 400)
+        hu = hu * ds.RescaleSlope + ds.RescaleIntercept
+    if return_hu:
+        return hu, ds
+    img = np.clip(hu, -1000, 400)
     img = (img - (-1000)) / 1400 * 255.0
     img = img.astype(np.uint8)
     return img, ds

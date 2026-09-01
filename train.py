@@ -1,5 +1,6 @@
 import os
 import csv
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,32 +9,58 @@ from tqdm import tqdm
 from torch.amp import GradScaler, autocast
 
 from model import SwinIRMed, SwinIRMedLoss
-from utils import read_ima_image, validate_model, build_swinir_med, get_default_transform
+from utils import read_ima_image, validate_model, build_swinir_med
+
+# 默认窗宽窗位（与 read_ima_image 的固定窗一致），保证验证/推理行为不变
+DEFAULT_WINDOW_LEVEL = -300.0
+DEFAULT_WINDOW_WIDTH = 1400.0
 
 # ===================== 数据集 =====================
 class SRDataset(data.Dataset):
-    def __init__(self, lr_dir, hr_dir, transform=None):
+    """CT 超分数据集（HU 级窗宽窗位增强）。
+    train=True 时对每个样本随机采样 (level, width) 并同时作用于 LR/HR，保证配对一致；
+    train=False 时使用默认窗，验证/推理结果可复现。
+    """
+    def __init__(self, lr_dir, hr_dir, train=False,
+                 level_range=(-600.0, 400.0), width_range=(300.0, 1400.0),
+                 default_level=DEFAULT_WINDOW_LEVEL, default_width=DEFAULT_WINDOW_WIDTH):
         self.lr_dir = lr_dir
         self.hr_dir = hr_dir
-        self.transform = transform
+        self.train = train
+        self.level_range = level_range
+        self.width_range = width_range
+        self.default_level = default_level
+        self.default_width = default_width
         self.img_names = sorted([f for f in os.listdir(lr_dir)
                                  if f.lower().endswith(('ima', 'dcm', 'png', 'jpg', 'jpeg'))])
         assert len(self.img_names) > 0, f"LR文件夹 {lr_dir} 中无有效医学影像！"
     def __len__(self):
         return len(self.img_names)
+    @staticmethod
+    def _window_to_tensor(hu, level, width):
+        low = level - width / 2.0
+        high = level + width / 2.0
+        out = np.clip((hu - low) / (high - low), 0.0, 1.0)
+        out = out.astype(np.float32) * 2.0 - 1.0   # -> [-1, 1]
+        return torch.from_numpy(out).unsqueeze(0)  # (1, H, W)
     def __getitem__(self, idx):
         img_name = self.img_names[idx]
         lr_path = os.path.join(self.lr_dir, img_name)
         hr_path = os.path.join(self.hr_dir, img_name)
-        lr_img, _ = read_ima_image(lr_path)
-        hr_img, _ = read_ima_image(hr_path)
-        if lr_img.shape[:2] != (128, 128):
-            raise ValueError(f"LR影像 {img_name} 尺寸错误，需为128×128，当前: {lr_img.shape[:2]}")
-        if hr_img.shape[:2] != (512, 512):
-            raise ValueError(f"HR影像 {img_name} 尺寸错误，需为512×512，当前: {hr_img.shape[:2]}")
-        if self.transform:
-            lr_img = self.transform(lr_img)
-            hr_img = self.transform(hr_img)
+        lr_hu, _ = read_ima_image(lr_path, return_hu=True)
+        hr_hu, _ = read_ima_image(hr_path, return_hu=True)
+        if lr_hu.shape[:2] != (128, 128):
+            raise ValueError(f"LR影像 {img_name} 尺寸错误，需为128×128，当前: {lr_hu.shape[:2]}")
+        if hr_hu.shape[:2] != (512, 512):
+            raise ValueError(f"HR影像 {img_name} 尺寸错误，需为512×512，当前: {hr_hu.shape[:2]}")
+        # 同一 (level, width) 同时作用于 LR/HR，保证配对一致
+        if self.train:
+            level = float(np.random.uniform(*self.level_range))
+            width = float(np.random.uniform(*self.width_range))
+        else:
+            level, width = self.default_level, self.default_width
+        lr_img = self._window_to_tensor(lr_hu, level, width)
+        hr_img = self._window_to_tensor(hr_hu, level, width)
         return lr_img, hr_img
 
 # ===================== 训练入口函数 =====================
@@ -42,14 +69,16 @@ def train_model(lr_dir, hr_dir, save_model_path, csv_save_path,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(
         f"使用设备: {device} | 训练数据：full‑1mm CT影像 | 模型：SwinIR‑Med | 模式：混合精度训练 (AMP) | 超分倍数：4x (128→512)")
-    transform = get_default_transform()
-    full_dataset = SRDataset(lr_dir, hr_dir, transform)
-    n_val = int(len(full_dataset) * val_ratio)
-    n_train = len(full_dataset) - n_val
-    train_dataset, val_dataset = data.random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
+    # 训练/验证使用不同的窗宽窗位策略：训练随机增强，验证固定默认窗（结果可复现）
+    train_dataset_full = SRDataset(lr_dir, hr_dir, train=True)
+    val_dataset_full = SRDataset(lr_dir, hr_dir, train=False)
+    n = len(train_dataset_full)
+    n_val = int(n * val_ratio)
+    n_train = n - n_val
+    g = torch.Generator().manual_seed(42)
+    train_idx, val_idx = data.random_split(range(n), [n_train, n_val], generator=g)
+    train_dataset = data.Subset(train_dataset_full, train_idx)
+    val_dataset = data.Subset(val_dataset_full, val_idx)
     train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = data.DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
     model = build_swinir_med(upscale_factor, device)
@@ -130,8 +159,8 @@ def train_model(lr_dir, hr_dir, save_model_path, csv_save_path,
 if __name__ == "__main__":
     LR_DIR = "dataset/128x128"
     HR_DIR = "dataset/512x512"
-    SAVE_MODEL_PATH = "result_swinir/swinir_med_4x_medical_8/swinir_med_4x_sr_amp.pth"
-    CSV_SAVE_PATH = "result_swinir/swinir_med_4x_medical_8/training_metrics_amp.csv"
+    SAVE_MODEL_PATH = "result_swinir/swinir_med_4x_medical_10/swinir_med_4x_sr_amp.pth"
+    CSV_SAVE_PATH = "result_swinir/swinir_med_4x_medical_10/training_metrics_amp.csv"
     os.makedirs(os.path.dirname(SAVE_MODEL_PATH), exist_ok=True)
     train_model(
         lr_dir=LR_DIR,
@@ -139,7 +168,7 @@ if __name__ == "__main__":
         save_model_path=SAVE_MODEL_PATH,
         csv_save_path=CSV_SAVE_PATH,
         batch_size=2,
-        epochs=2,
+        epochs=10,
         learning_rate=1e-4,
         upscale_factor=4,
         val_ratio=0.1

@@ -45,8 +45,8 @@ def test_batch_images(model_path, input_folder, output_folder, upscale_factor=4)
 
 if __name__ == "__main__":
     TEST_BATCH_INPUT = "dataset/test_4x"
-    TEST_BATCH_OUTPUT = "result_swinir/swinir_med_4x_medical_8/test_output_amp"
-    BEST_MODEL = "result_swinir/swinir_med_4x_medical_8/swinir_med_4x_sr_amp_best.pth"
+    TEST_BATCH_OUTPUT = "result_swinir/swinir_med_4x_medical_9/test_output_amp"
+    BEST_MODEL = "result_swinir/swinir_med_4x_medical_9/swinir_med_4x_sr_amp_best.pth"
     os.makedirs(TEST_BATCH_OUTPUT, exist_ok=True)
     test_batch_images(
         model_path=BEST_MODEL,
