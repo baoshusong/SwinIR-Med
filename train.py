@@ -96,9 +96,18 @@ def train_model(lr_dir, hr_dir, save_model_path, csv_save_path,
         use_edge_loss=True,
         edge_weight=0.01,
         use_tv_loss=True,
-        tv_weight=0.08,
+        tv_weight=0.02,        # 下调：避免过平滑
         use_smooth_loss=True,
-        smooth_weight=0.04
+        smooth_weight=0.01,    # 下调：避免过平滑
+        use_hu_loss=True,
+        hu_weight=0.10,
+        use_consist_loss=True,
+        consist_weight=0.05,
+        use_deg_loss=True,
+        deg_weight=0.02,
+        use_fft_loss=True,
+        fft_weight=0.05,       # 频域高频约束：恢复临床纹理
+        fft_alpha=1.0
     )
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-6)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
@@ -179,8 +188,8 @@ def train_model(lr_dir, hr_dir, save_model_path, csv_save_path,
 if __name__ == "__main__":
     LR_DIR = "dataset/128x128"
     HR_DIR = "dataset/512x512"
-    SAVE_MODEL_PATH = "result_swinir/swinir_med_4x_medical_11/swinir_med_4x_sr_amp.pth"
-    CSV_SAVE_PATH = "result_swinir/swinir_med_4x_medical_11/training_metrics_amp.csv"
+    SAVE_MODEL_PATH = "result_swinir/swinir_med_4x_medical_12/swinir_med_4x_sr_amp.pth"
+    CSV_SAVE_PATH = "result_swinir/swinir_med_4x_medical_12/training_metrics_amp.csv"
     os.makedirs(os.path.dirname(SAVE_MODEL_PATH), exist_ok=True)
     train_model(
         lr_dir=LR_DIR,

@@ -422,6 +422,7 @@ class SwinIRMedLoss(nn.Module):
                  use_hu_loss=True, hu_weight=0.10,
                  use_consist_loss=True, consist_weight=0.05,
                  use_deg_loss=True, deg_weight=0.02,
+                 use_fft_loss=True, fft_weight=0.05, fft_alpha=1.0,
                  upscale=4):
         super().__init__()
         self.l1_loss = nn.L1Loss()
@@ -438,6 +439,9 @@ class SwinIRMedLoss(nn.Module):
         self.consist_weight = consist_weight
         self.use_deg_loss = use_deg_loss
         self.deg_weight = deg_weight
+        self.use_fft_loss = use_fft_loss
+        self.fft_weight = fft_weight
+        self.fft_alpha = fft_alpha
         self.upscale = upscale
         # Sobel 核注册为 buffer，避免每次前向重建
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
@@ -464,6 +468,24 @@ class SwinIRMedLoss(nn.Module):
         diff_h2 = x[:, :, :, 2:] - 2 * x[:, :, :, 1:-1] + x[:, :, :, :-2]
         diff_v2 = x[:, :, 2:, :] - 2 * x[:, :, 1:-1, :] + x[:, :, :-2, :]
         return torch.mean(torch.abs(diff_h2)) + torch.mean(torch.abs(diff_v2))
+    def high_freq_fft_loss(self, pred, gt, alpha=1.0):
+        """频域高频一致性损失：仅比较 HR 与预测图的高频分量（径向高通），
+        迫使模型恢复被 TV/smooth 损失磨掉的临床纹理（肠管气纹、骨小梁、筋膜线）。
+        同时约束实/虚部，兼顾幅度与相位。"""
+        def spectrum(x):
+            f = torch.fft.fft2(x, norm='ortho')
+            return torch.fft.fftshift(f, dim=(-2, -1))
+        sp, sg = spectrum(pred), spectrum(gt)
+        _, _, H, W = pred.shape
+        freq_y = torch.fft.fftfreq(H, device=pred.device)
+        freq_x = torch.fft.fftfreq(W, device=pred.device)
+        Y, X = torch.meshgrid(freq_y, freq_x, indexing='ij')
+        dist = torch.sqrt(X ** 2 + Y ** 2)
+        mask = (dist / 0.5) ** alpha                 # 低频→0，高频→1
+        mask = mask / (mask.max() + 1e-8)
+        mask = mask.view(1, 1, H, W)
+        sp_h, sg_h = sp * mask, sg * mask
+        return self.l1_loss(sp_h.real, sg_h.real) + self.l1_loss(sp_h.imag, sg_h.imag)
     def forward(self, hr_pred, hr_gt, lr_center=None, level=None, width=None,
                 deg_z_lr=None, deg_z_pred=None):
         pixel_loss = self.l1_loss(hr_pred, hr_gt)
@@ -494,4 +516,7 @@ class SwinIRMedLoss(nn.Module):
         # 退化码一致性：下采样 HR 的退化表征应与观测 LR 退化表征一致
         if self.use_deg_loss and deg_z_lr is not None and deg_z_pred is not None:
             total_loss += self.deg_weight * self.l1_loss(deg_z_lr, deg_z_pred)
+        # 频域高频一致性：恢复被磨掉的临床纹理
+        if self.use_fft_loss:
+            total_loss += self.fft_weight * self.high_freq_fft_loss(hr_pred, hr_gt, alpha=self.fft_alpha)
         return total_loss
