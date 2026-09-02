@@ -1,6 +1,8 @@
 """SwinIR‑Med 公共工具：DICOM IO、数据变换、模型工厂、验证函数"""
 import datetime
+import os
 import numpy as np
+import cv2
 import torch
 import pydicom
 from pydicom.uid import ExplicitVRLittleEndian, CTImageStorage
@@ -14,12 +16,18 @@ from model import SwinIRMed
 # ===================== 默认模型配置（test.py / train.py 共用） =====================
 MODEL_CONFIG = dict(
     img_size=128,
+    in_chans=3,        # 2.5D：中心切片 + 上下相邻切片
+    deg_dim=16,        # 退化表征维度
     embed_dim=60,
     depths=[6, 6, 6, 6],
     num_heads=[6, 6, 6, 6],
     window_size=8,
     mlp_ratio=2.0,
 )
+
+# 默认窗宽窗位（与 read_ima_image 的固定窗一致），保证验证/推理行为不变
+DEFAULT_WINDOW_LEVEL = -300.0
+DEFAULT_WINDOW_WIDTH = 1400.0
 # 归一化系数，必须与 get_default_transform 保持一致
 NORM_MEAN = 0.5
 NORM_STD = 0.5
@@ -44,6 +52,36 @@ def build_swinir_med(upscale_factor=4, device=None):
     if device is not None:
         model = model.to(device)
     return model
+
+# ===================== 2.5D 窗宽窗位工具 =====================
+def window_hu_to_tensor(hu, level, width):
+    """将 HU 数组按 (level, width) 窗宽窗位归一化到 [-1,1] 的 (1,H,W) 张量"""
+    low = level - width / 2.0
+    high = level + width / 2.0
+    out = np.clip((hu - low) / (high - low), 0.0, 1.0).astype(np.float32) * 2.0 - 1.0
+    return torch.from_numpy(out).unsqueeze(0)
+
+def build_25d_test_input(folder, names, idx, device):
+    """构造单张 CT 的 2.5D 推理输入 (1,3,H,W)：中心切片 + 上下相邻切片（越界复制边缘）。
+    返回 (tensor, center_ds, center_name)。相邻切片统一按默认窗宽窗位窗化。
+    """
+    n = len(names)
+    def at(i):
+        i = max(0, min(n - 1, i))
+        return names[i]
+    center_name = names[idx]
+    chosen = [at(idx - 1), center_name, at(idx + 1)]
+    slices, center_ds = [], None
+    for nm in chosen:
+        hu, ds = read_ima_image(os.path.join(folder, nm), return_hu=True)
+        if hu.shape[:2] != (128, 128):
+            hu = cv2.resize(hu, (128, 128), interpolation=cv2.INTER_LINEAR)
+        t = window_hu_to_tensor(hu, DEFAULT_WINDOW_LEVEL, DEFAULT_WINDOW_WIDTH)
+        slices.append(t)
+        if nm == center_name:
+            center_ds = ds
+    tensor = torch.cat(slices, dim=0).unsqueeze(0).to(device)   # (1,3,H,W)
+    return tensor, center_ds, center_name
 
 # ===================== DICOM工具函数 =====================
 def read_ima_image(path, return_hu=False):
@@ -132,7 +170,8 @@ def validate_model(model, val_loader, device):
     model.eval()
     total_psnr, total_ssim, count = 0.0, 0.0, 0
     with torch.no_grad():
-        for lr_imgs, hr_imgs in val_loader:
+        for batch in val_loader:
+            lr_imgs, hr_imgs = batch[0], batch[1]
             lr_imgs = lr_imgs.to(device)
             hr_imgs = hr_imgs.to(device)
             hr_pred = model(lr_imgs)

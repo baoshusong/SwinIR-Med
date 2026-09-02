@@ -254,29 +254,40 @@ class ResidualGroup(nn.Module):
         return fused_feat + res
 
 class DegradationAwareModule(nn.Module):
-    """盲退化建模模块"""
-    def __init__(self, in_chans=1, embed_dim=60):
+    """盲退化建模模块（CT 显式退化空间）。
+
+    将 LR 切片编码为低维退化表征 z，并映射为逐通道 FiLM 调制参数。
+    退化空间显式覆盖 CT 采集的三要素：下采样核(kernel)、噪声水平(noise)、层厚(slice thickness)，
+    由网络从数据中学习得到，用于驱动各残差组的退化自适应调制（blind SR）。
+    """
+    def __init__(self, in_chans=1, embed_dim=60, deg_dim=16):
         super().__init__()
+        self.deg_dim = deg_dim
         self.encoder = nn.Sequential(
             nn.Conv2d(in_chans, 32, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, embed_dim, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.AdaptiveAvgPool2d(1)
         )
+        # 退化表征投影：encoder 特征 -> 低维退化码 z
+        self.code_fc = nn.Linear(128, deg_dim)
+        # z -> FiLM(scale, shift)
         self.modulation_fc = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(deg_dim, embed_dim),
             nn.ReLU(inplace=True),
             nn.Linear(embed_dim, embed_dim * 2)
         )
     def forward(self, x):
-        deg_feat = self.encoder(x).flatten(1)
-        modulation_params = self.modulation_fc(deg_feat)
+        deg_feat = self.encoder(x).flatten(1)              # (B, 128)
+        z = self.code_fc(deg_feat)                         # (B, deg_dim) 退化表征
+        modulation_params = self.modulation_fc(z)
         scale, shift = modulation_params.chunk(2, dim=1)
         scale = scale.unsqueeze(-1).unsqueeze(-1)
         shift = shift.unsqueeze(-1).unsqueeze(-1)
-        return scale, shift
+        return z, scale, shift
 
 class SkipConnectionBlock(nn.Module):
     """U‑Net式跳跃连接，浅层特征上采样"""
@@ -293,20 +304,21 @@ class SkipConnectionBlock(nn.Module):
 
 class SwinIRMed(nn.Module):
     """SwinIR‑Med：医学影像4x超分"""
-    def __init__(self, img_size=128, patch_size=1, in_chans=1, out_chans=1,
+    def __init__(self, img_size=128, patch_size=1, in_chans=3, out_chans=1, deg_dim=16,
                  embed_dim=60, depths=[6, 6, 6, 6], num_heads=[6, 6, 6, 6],
                  window_size=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, upscale=4):
         super().__init__()
         self.upscale = upscale
+        self.in_chans = in_chans
         self.embed_dim = embed_dim
         self.num_layers = len(depths)
         self.num_features = embed_dim
         self.img_size = img_size
         self.patch_size = patch_size
         self.window_size = window_size
-        self.degradation_module = DegradationAwareModule(in_chans=in_chans, embed_dim=embed_dim)
+        self.degradation_module = DegradationAwareModule(in_chans=1, embed_dim=embed_dim, deg_dim=deg_dim)
         self.conv_first = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1)
         self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=embed_dim, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
@@ -370,12 +382,15 @@ class SwinIRMed(nn.Module):
         x = self.norm(x)
         x = tokens_to_image(x, x_size[0], x_size[1])
         return x
-    def forward(self, x):
-        global_residual = F.interpolate(x, scale_factor=self.upscale, mode='bicubic', align_corners=False)
+    def forward(self, x, return_deg=False):
+        # 2.5D：仅用中心切片做全局残差（bicubic 上采样），保持输出为单通道
+        c = self.in_chans // 2
+        center = x[:, c:c + 1]
+        global_residual = F.interpolate(center, scale_factor=self.upscale, mode='bicubic', align_corners=False)
         x_first = self.conv_first(x)
         skip_feat = x_first
         # 退化编码：注入到每个残差组（token 空间形状 (B,1,C)）
-        deg_scale, deg_shift = self.degradation_module(x)          # (B, C, 1, 1)
+        z, deg_scale, deg_shift = self.degradation_module(center)  # 对中心切片编码退化，z:(B,deg_dim)
         B, C = deg_scale.shape[0], deg_scale.shape[1]
         deg_scale_t = deg_scale.view(B, 1, C)
         deg_shift_t = deg_shift.view(B, 1, C)
@@ -387,13 +402,27 @@ class SwinIRMed(nn.Module):
         fused = self.fusion_skip(torch.cat([x_upscale, skip_upscaled], dim=1))
         hr_residual = self.conv_last(fused)
         hr_img = global_residual + hr_residual
+        if return_deg:
+            return hr_img, z
         return hr_img
 
 # ===================== 损失函数 =====================
 class SwinIRMedLoss(nn.Module):
-    def __init__(self, use_edge_loss=True, edge_weight=0.03,
-                 use_tv_loss=True, tv_weight=0.012,
-                 use_smooth_loss=True, smooth_weight=0.005):
+    """SwinIR‑Med 复合损失。
+
+    在原有 像素L1 + 边缘(Sobel) + TV + 平滑 基础上，新增三类物理/临床驱动项：
+      - HU 保真损失：在 HU 绝对空间回归（而非仅归一化窗宽空间），保证 CT 值可解释；
+      - 下采样一致性损失：HR 预测按同一倍数下采样后应重建回观测 LR（自监督物理约束）；
+      - 退化码一致性损失：HR 预测下采样后的退化表征应与观测 LR 的退化表征一致
+        （与 DegradationAwareModule 的盲退化建模闭环，强化 #2）。
+    """
+    def __init__(self, use_edge_loss=True, edge_weight=0.01,
+                 use_tv_loss=True, tv_weight=0.08,
+                 use_smooth_loss=True, smooth_weight=0.04,
+                 use_hu_loss=True, hu_weight=0.10,
+                 use_consist_loss=True, consist_weight=0.05,
+                 use_deg_loss=True, deg_weight=0.02,
+                 upscale=4):
         super().__init__()
         self.l1_loss = nn.L1Loss()
         self.mse_loss = nn.MSELoss()
@@ -403,6 +432,13 @@ class SwinIRMedLoss(nn.Module):
         self.tv_weight = tv_weight
         self.use_smooth_loss = use_smooth_loss
         self.smooth_weight = smooth_weight
+        self.use_hu_loss = use_hu_loss
+        self.hu_weight = hu_weight
+        self.use_consist_loss = use_consist_loss
+        self.consist_weight = consist_weight
+        self.use_deg_loss = use_deg_loss
+        self.deg_weight = deg_weight
+        self.upscale = upscale
         # Sobel 核注册为 buffer，避免每次前向重建
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                                dtype=torch.float32).view(1, 1, 3, 3)
@@ -428,7 +464,8 @@ class SwinIRMedLoss(nn.Module):
         diff_h2 = x[:, :, :, 2:] - 2 * x[:, :, :, 1:-1] + x[:, :, :, :-2]
         diff_v2 = x[:, :, 2:, :] - 2 * x[:, :, 1:-1, :] + x[:, :, :-2, :]
         return torch.mean(torch.abs(diff_h2)) + torch.mean(torch.abs(diff_v2))
-    def forward(self, hr_pred, hr_gt):
+    def forward(self, hr_pred, hr_gt, lr_center=None, level=None, width=None,
+                deg_z_lr=None, deg_z_pred=None):
         pixel_loss = self.l1_loss(hr_pred, hr_gt)
         total_loss = pixel_loss
         if self.use_edge_loss:
@@ -440,4 +477,21 @@ class SwinIRMedLoss(nn.Module):
         if self.use_smooth_loss:
             smooth_loss = self.smooth_loss(hr_pred)
             total_loss += self.smooth_weight * smooth_loss
+        # HU 保真损失：反窗宽窗位到 HU 空间做 L1（临床意义：绝对 CT 值可解释）
+        if self.use_hu_loss and level is not None and width is not None:
+            level = torch.as_tensor(level, device=hr_pred.device, dtype=hr_pred.dtype)
+            width = torch.as_tensor(width, device=hr_pred.device, dtype=hr_pred.dtype)
+            low = (level - width / 2.0).view(-1, 1, 1, 1)
+            span = (width).view(-1, 1, 1, 1)
+            pred_hu = low + (hr_pred * 0.5 + 0.5) * span
+            gt_hu = low + (hr_gt * 0.5 + 0.5) * span
+            total_loss += self.hu_weight * self.l1_loss(pred_hu, gt_hu)
+        # 下采样一致性：HR 预测下采样后应与观测 LR（中心通道）一致
+        if self.use_consist_loss and lr_center is not None:
+            lr_hat = F.interpolate(hr_pred, scale_factor=1.0 / self.upscale,
+                                   mode='bicubic', align_corners=False)
+            total_loss += self.consist_weight * self.l1_loss(lr_hat, lr_center)
+        # 退化码一致性：下采样 HR 的退化表征应与观测 LR 退化表征一致
+        if self.use_deg_loss and deg_z_lr is not None and deg_z_pred is not None:
+            total_loss += self.deg_weight * self.l1_loss(deg_z_lr, deg_z_pred)
         return total_loss

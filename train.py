@@ -3,6 +3,7 @@ import csv
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data as data
 from tqdm import tqdm
@@ -44,24 +45,33 @@ class SRDataset(data.Dataset):
         out = out.astype(np.float32) * 2.0 - 1.0   # -> [-1, 1]
         return torch.from_numpy(out).unsqueeze(0)  # (1, H, W)
     def __getitem__(self, idx):
-        img_name = self.img_names[idx]
-        lr_path = os.path.join(self.lr_dir, img_name)
-        hr_path = os.path.join(self.hr_dir, img_name)
-        lr_hu, _ = read_ima_image(lr_path, return_hu=True)
+        # 2.5D：中心切片 + 上下相邻切片作为上下文（越界复制边缘切片），目标仅为中心 HR
+        n = len(self.img_names)
+        def name_at(i):
+            i = max(0, min(n - 1, i))
+            return self.img_names[i]
+        center_name = self.img_names[idx]
+        neighbor_names = [name_at(idx - 1), center_name, name_at(idx + 1)]
+        lr_stack = []
+        for nm in neighbor_names:
+            lr_path = os.path.join(self.lr_dir, nm)
+            lr_hu, _ = read_ima_image(lr_path, return_hu=True)
+            if lr_hu.shape[:2] != (128, 128):
+                raise ValueError(f"LR影像 {nm} 尺寸错误，需为128×128，当前: {lr_hu.shape[:2]}")
+            lr_stack.append(lr_hu)
+        hr_path = os.path.join(self.hr_dir, center_name)
         hr_hu, _ = read_ima_image(hr_path, return_hu=True)
-        if lr_hu.shape[:2] != (128, 128):
-            raise ValueError(f"LR影像 {img_name} 尺寸错误，需为128×128，当前: {lr_hu.shape[:2]}")
         if hr_hu.shape[:2] != (512, 512):
-            raise ValueError(f"HR影像 {img_name} 尺寸错误，需为512×512，当前: {hr_hu.shape[:2]}")
-        # 同一 (level, width) 同时作用于 LR/HR，保证配对一致
+            raise ValueError(f"HR影像 {center_name} 尺寸错误，需为512×512，当前: {hr_hu.shape[:2]}")
+        # 同一 (level, width) 同时作用于所有 LR 切片与中心 HR，保证配对一致
         if self.train:
             level = float(np.random.uniform(*self.level_range))
             width = float(np.random.uniform(*self.width_range))
         else:
             level, width = self.default_level, self.default_width
-        lr_img = self._window_to_tensor(lr_hu, level, width)
-        hr_img = self._window_to_tensor(hr_hu, level, width)
-        return lr_img, hr_img
+        lr_img = torch.cat([self._window_to_tensor(h, level, width) for h in lr_stack], dim=0)  # (3,H,W)
+        hr_img = self._window_to_tensor(hr_hu, level, width)                                    # (1,H,W)
+        return lr_img, hr_img, level, width
 
 # ===================== 训练入口函数 =====================
 def train_model(lr_dir, hr_dir, save_model_path, csv_save_path,
@@ -118,13 +128,23 @@ def train_model(lr_dir, hr_dir, save_model_path, csv_save_path,
         model.train()
         epoch_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} (AMP)")
-        for lr_imgs, hr_imgs in pbar:
+        for lr_imgs, hr_imgs, levels, widths in pbar:
             lr_imgs = lr_imgs.to(device)
             hr_imgs = hr_imgs.to(device)
             optimizer.zero_grad()
             with autocast('cuda'):
                 hr_pred = model(lr_imgs)
-                total_loss = loss_fn(hr_pred, hr_imgs)
+                # 退化码一致性：观测 LR（中心通道）与 HR 预测下采样后的退化表征应一致
+                lr_center = lr_imgs[:, 1:2]
+                z_lr = model.degradation_module(lr_center)[0]
+                hr_down = F.interpolate(hr_pred.detach(), scale_factor=1.0 / model.upscale,
+                                        mode='bicubic', align_corners=False)
+                z_pred = model.degradation_module(hr_down)[0]
+                total_loss = loss_fn(
+                    hr_pred, hr_imgs,
+                    lr_center=lr_center, level=levels, width=widths,
+                    deg_z_lr=z_lr, deg_z_pred=z_pred
+                )
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -159,8 +179,8 @@ def train_model(lr_dir, hr_dir, save_model_path, csv_save_path,
 if __name__ == "__main__":
     LR_DIR = "dataset/128x128"
     HR_DIR = "dataset/512x512"
-    SAVE_MODEL_PATH = "result_swinir/swinir_med_4x_medical_10/swinir_med_4x_sr_amp.pth"
-    CSV_SAVE_PATH = "result_swinir/swinir_med_4x_medical_10/training_metrics_amp.csv"
+    SAVE_MODEL_PATH = "result_swinir/swinir_med_4x_medical_11/swinir_med_4x_sr_amp.pth"
+    CSV_SAVE_PATH = "result_swinir/swinir_med_4x_medical_11/training_metrics_amp.csv"
     os.makedirs(os.path.dirname(SAVE_MODEL_PATH), exist_ok=True)
     train_model(
         lr_dir=LR_DIR,
@@ -168,7 +188,7 @@ if __name__ == "__main__":
         save_model_path=SAVE_MODEL_PATH,
         csv_save_path=CSV_SAVE_PATH,
         batch_size=2,
-        epochs=10,
+        epochs=100,
         learning_rate=1e-4,
         upscale_factor=4,
         val_ratio=0.1
